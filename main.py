@@ -19,6 +19,7 @@ from notion_client import Client
 
 from mailer import send_email_notification
 from models import NotionWebhookPayload
+from notion_contacts import get_attendee_emails
 from summarizer import parse_summary, summarize_with_claude
 
 load_dotenv()
@@ -161,7 +162,7 @@ def _extract_stt_text(page_id: str) -> str:
 
 # ── 백그라운드 처리 ────────────────────────────────────────
 async def _process_meeting(
-    page_id: str, page_url: str, title: str, date: str
+    page_id: str, page_url: str, title: str, date: str, page: dict
 ) -> None:
     try:
         logger.info(f"[{title}] 처리 시작")
@@ -173,15 +174,24 @@ async def _process_meeting(
         one_liner, sections = parse_summary(summary_text)
         logger.info(f"[{title}] 요약 완료: {one_liner}")
 
+        # ── 수신자 결정: 참석자 → fallback: RECIPIENT_EMAILS ──
+        emails = get_attendee_emails(notion, page)
+        if emails:
+            to_email = ",".join(emails)
+            logger.info(f"[{title}] 수신자 (참석자 조회): {to_email}")
+        else:
+            to_email = RECIPIENT_EMAILS
+            logger.warning(f"[{title}] 참석자 매칭 없음 → fallback: {to_email}")
+
         send_email_notification(
-            to_email=RECIPIENT_EMAILS,
+            to_email=to_email,
             meeting_title=title,
             meeting_date=date,
             one_liner=one_liner,
             sections=sections,
             page_url=page_url,
         )
-        logger.info(f"[{title}] 이메일 발송 완료")
+        logger.info(f"[{title}] 이메일 발송 완료 → {to_email}")
 
     except Exception as e:
         logger.error(f"[{title}] 처리 실패: {e}", exc_info=True)
@@ -243,7 +253,7 @@ async def webhook_meeting_summary(
     logger.info(f"웹훅 수신: {title} ({date}) page_id={page_id}")
 
     # ── 6. 백그라운드 처리 위임 ───────────────────────────
-    background_tasks.add_task(_process_meeting, page_id, page_url, title, date)
+    background_tasks.add_task(_process_meeting, page_id, page_url, title, date, page)
 
     return JSONResponse({"status": "accepted", "title": title}, status_code=202)
 
