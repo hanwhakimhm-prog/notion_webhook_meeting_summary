@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+anthropic
+notion-client==2.2.1
+requests
+pydantic
