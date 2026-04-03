@@ -20,6 +20,7 @@ from notion_client import Client
 from mailer import send_email_notification
 from models import NotionWebhookPayload
 from notion_contacts import get_attendee_emails
+from notion_writer import append_summary_to_page
 from summarizer import parse_summary, summarize_with_claude
 
 load_dotenv()
@@ -183,6 +184,10 @@ async def _process_meeting(
             to_email = RECIPIENT_EMAILS
             logger.warning(f"[{title}] 참석자 매칭 없음 → fallback: {to_email}")
 
+        # ── Notion 페이지 하단에 요약 추가 ────────────────
+        append_summary_to_page(notion, page_id, title, date, one_liner, sections)
+
+        # ── 이메일 발송 ────────────────────────────────
         send_email_notification(
             to_email=to_email,
             meeting_title=title,
