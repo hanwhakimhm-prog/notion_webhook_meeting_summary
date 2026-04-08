@@ -277,48 +277,36 @@ async def webhook_meeting_summary(
     if user_agent and "notion" not in ua_lower and "python" not in ua_lower:
         logger.warning(f"비표준 User-Agent 감지: {user_agent}")
 
-    # ── 4. workspace_id 추출 및 Notion Client 결정 ────────
-    logger.info(f"payload keys: {list(body.keys())}")
-    logger.info(f"payload source: {body.get('source')}")
-    logger.info(f"payload data keys: {list((body.get('data') or {}).keys())}")
-
-    data = body.get("data") or {}
-    workspace_id = (
-        body.get("workspace_id")
-        or data.get("workspace_id")
-        or body.get("source", {}).get("workspace_id")
-    )
-    if not workspace_id:
-        logger.warning(f"workspace_id 없음. 전체 payload: {body}")
-        raise HTTPException(status_code=400, detail="workspace_id를 찾을 수 없습니다.")
-
-    notion = WORKSPACE_CLIENTS.get(workspace_id)
-    if notion is None:
-        logger.warning(f"알 수 없는 workspace_id: {workspace_id}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"지원하지 않는 워크스페이스입니다: {workspace_id}",
-        )
-    logger.info(f"워크스페이스 확인: {workspace_id}")
-
-    # ── 5. page_id 추출 ───────────────────────────────────
+    # ── 4. page_id 추출 ───────────────────────────────────
     # 노션 자동화 payload: {"data": {"id": "<page_id>", ...}, "source": {...}}
     # 직접 호출 fallback:  {"page_id": "<page_id>", "secret": "..."}
+    data = body.get("data") or {}
     page_id = data.get("id") or body.get("page_id")
     if not page_id:
         raise HTTPException(status_code=400, detail="page_id를 찾을 수 없습니다.")
 
-    # ── 6. Notion 페이지 메타 조회 ────────────────────────
-    try:
-        page = notion.pages.retrieve(page_id=page_id)
-    except Exception as e:
-        logger.error(f"Notion 페이지 조회 실패: {e}")
+    # ── 5. 워크스페이스 자동 감지 ─────────────────────────
+    # Notion 자동화 payload에 workspace_id가 포함되지 않으므로,
+    # 등록된 클라이언트를 순서대로 시도해 페이지 조회에 성공한 걸 사용.
+    notion = None
+    page = None
+    for ws_id, client in WORKSPACE_CLIENTS.items():
+        try:
+            page = client.pages.retrieve(page_id=page_id)
+            notion = client
+            logger.info(f"워크스페이스 자동 감지 성공: {ws_id}")
+            break
+        except Exception:
+            continue
+
+    if notion is None:
+        logger.error(f"모든 워크스페이스에서 페이지 조회 실패: page_id={page_id}")
         raise HTTPException(status_code=500, detail="Notion 페이지 조회 실패")
 
     title, date, page_url = _extract_page_metadata(page)
     logger.info(f"웹훅 수신: {title} ({date}) page_id={page_id}")
 
-    # ── 7. 백그라운드 처리 위임 ───────────────────────────
+    # ── 6. 백그라운드 처리 위임 ───────────────────────────
     background_tasks.add_task(
         _process_meeting, page_id, page_url, title, date, page, notion
     )
