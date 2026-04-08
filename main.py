@@ -296,8 +296,8 @@ async def webhook_meeting_summary(
             notion = client
             logger.info(f"워크스페이스 자동 감지 성공: {ws_id}")
             break
-        except Exception:
-            continue
+        except Exception as e:
+            logger.warning(f"워크스페이스 {ws_id} 조회 실패: {e}")
 
     if notion is None:
         logger.error(f"모든 워크스페이스에서 페이지 조회 실패: page_id={page_id}")
