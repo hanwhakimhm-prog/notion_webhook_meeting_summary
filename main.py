@@ -6,11 +6,16 @@
 - 불일치 시 401 반환 + 로그 기록
 - User-Agent 보조 체크 (Notion 외 출처 경고)
 - /docs, /redoc, /openapi.json 비활성화
+
+멀티 워크스페이스:
+- payload 의 workspace_id 로 워크스페이스 식별
+- WORKSPACE_ID_N / NOTION_TOKEN_WS_N 쌍으로 워크스페이스별 토큰 관리
+- 알 수 없는 workspace_id 는 400 반환
 """
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
@@ -34,11 +39,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WEBHOOK_SECRET  = os.environ["WEBHOOK_SECRET"]
-NOTION_API_KEY  = os.environ["NOTION_API_KEY"]
+WEBHOOK_SECRET   = os.environ["WEBHOOK_SECRET"]
 RECIPIENT_EMAILS = os.environ["RECIPIENT_EMAILS"]  # 콤마 또는 줄바꿈 구분
 
-notion = Client(auth=NOTION_API_KEY)
+
+# ── 멀티 워크스페이스 클라이언트 맵 ────────────────────────
+def _build_workspace_clients() -> Dict[str, Client]:
+    """
+    환경변수 WORKSPACE_ID_N / NOTION_TOKEN_WS_N 쌍을 읽어
+    {workspace_id: NotionClient} 딕셔너리 구성.
+
+    예시:
+      WORKSPACE_ID_1=abc123  NOTION_TOKEN_WS_1=secret_xxx
+      WORKSPACE_ID_2=def456  NOTION_TOKEN_WS_2=secret_yyy
+    """
+    clients: Dict[str, Client] = {}
+    i = 1
+    while True:
+        ws_id = os.environ.get(f"WORKSPACE_ID_{i}")
+        token = os.environ.get(f"NOTION_TOKEN_WS_{i}")
+        if not ws_id or not token:
+            break
+        clients[ws_id] = Client(auth=token)
+        logger.info(f"워크스페이스 등록: WORKSPACE_ID_{i}={ws_id}")
+        i += 1
+
+    if not clients:
+        raise RuntimeError(
+            "등록된 워크스페이스가 없습니다. "
+            "WORKSPACE_ID_1 / NOTION_TOKEN_WS_1 환경변수를 확인하세요."
+        )
+    return clients
+
+
+WORKSPACE_CLIENTS: Dict[str, Client] = _build_workspace_clients()
 
 
 # ── 유틸 ───────────────────────────────────────────────────
@@ -66,7 +100,7 @@ def _extract_page_metadata(page: dict) -> Tuple[str, str, str]:
     return title, date, url
 
 
-def _collect_text_recursive(block_id: str) -> list:
+def _collect_text_recursive(block_id: str, notion: Client) -> list:
     """블록과 하위 블록에서 텍스트를 재귀적으로 수집."""
     text_block_types = {
         "paragraph", "bulleted_list_item", "numbered_list_item",
@@ -91,11 +125,11 @@ def _collect_text_recursive(block_id: str) -> list:
         if btype in text_block_types and text.strip():
             lines.append(text)
         if b.get("has_children"):
-            lines.extend(_collect_text_recursive(b["id"]))
+            lines.extend(_collect_text_recursive(b["id"], notion))
     return lines
 
 
-def _extract_stt_text(page_id: str) -> str:
+def _extract_stt_text(page_id: str, notion: Client) -> str:
     """
     Notion 페이지 블록에서 받아쓰기(STT) 텍스트 추출.
 
@@ -115,7 +149,7 @@ def _extract_stt_text(page_id: str) -> str:
     # ── 1순위: transcription 블록 ──────────────────────────
     for block in all_blocks:
         if block["type"] == "transcription":
-            lines = _collect_text_recursive(block["id"])
+            lines = _collect_text_recursive(block["id"], notion)
             if lines:
                 logger.info(f"transcription 블록에서 추출 완료 ({len(lines)}줄)")
                 return "\n".join(lines)
@@ -157,18 +191,18 @@ def _extract_stt_text(page_id: str) -> str:
         if text.strip():
             all_lines.append(text)
         if block.get("has_children"):
-            all_lines.extend(_collect_text_recursive(block["id"]))
+            all_lines.extend(_collect_text_recursive(block["id"], notion))
     return "\n".join(all_lines)
 
 
 # ── 백그라운드 처리 ────────────────────────────────────────
 async def _process_meeting(
-    page_id: str, page_url: str, title: str, date: str, page: dict
+    page_id: str, page_url: str, title: str, date: str, page: dict, notion: Client
 ) -> None:
     try:
         logger.info(f"[{title}] 처리 시작")
 
-        stt_text = _extract_stt_text(page_id)
+        stt_text = _extract_stt_text(page_id, notion)
         logger.info(f"[{title}] STT 추출 완료 ({len(stt_text)}자)")
 
         summary_text = summarize_with_claude(meeting_title=title, memo=stt_text)
@@ -215,6 +249,10 @@ async def webhook_meeting_summary(
     인증 우선순위:
       1. X-Webhook-Secret 헤더
       2. payload body 의 "secret" 필드
+
+    워크스페이스 식별:
+      payload 의 "workspace_id" 필드로 Notion Client 결정.
+      등록되지 않은 workspace_id 는 400 반환.
     """
     user_agent = request.headers.get("user-agent", "")
 
@@ -239,15 +277,33 @@ async def webhook_meeting_summary(
     if user_agent and "notion" not in ua_lower and "python" not in ua_lower:
         logger.warning(f"비표준 User-Agent 감지: {user_agent}")
 
-    # ── 4. page_id 추출 ───────────────────────────────────
+    # ── 4. workspace_id 추출 및 Notion Client 결정 ────────
+    data = body.get("data") or {}
+    workspace_id = (
+        body.get("workspace_id")
+        or data.get("workspace_id")
+        or body.get("source", {}).get("workspace_id")
+    )
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id를 찾을 수 없습니다.")
+
+    notion = WORKSPACE_CLIENTS.get(workspace_id)
+    if notion is None:
+        logger.warning(f"알 수 없는 workspace_id: {workspace_id}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"지원하지 않는 워크스페이스입니다: {workspace_id}",
+        )
+    logger.info(f"워크스페이스 확인: {workspace_id}")
+
+    # ── 5. page_id 추출 ───────────────────────────────────
     # 노션 자동화 payload: {"data": {"id": "<page_id>", ...}, "source": {...}}
     # 직접 호출 fallback:  {"page_id": "<page_id>", "secret": "..."}
-    data = body.get("data") or {}
     page_id = data.get("id") or body.get("page_id")
     if not page_id:
         raise HTTPException(status_code=400, detail="page_id를 찾을 수 없습니다.")
 
-    # ── 5. Notion 페이지 메타 조회 ────────────────────────
+    # ── 6. Notion 페이지 메타 조회 ────────────────────────
     try:
         page = notion.pages.retrieve(page_id=page_id)
     except Exception as e:
@@ -257,8 +313,10 @@ async def webhook_meeting_summary(
     title, date, page_url = _extract_page_metadata(page)
     logger.info(f"웹훅 수신: {title} ({date}) page_id={page_id}")
 
-    # ── 6. 백그라운드 처리 위임 ───────────────────────────
-    background_tasks.add_task(_process_meeting, page_id, page_url, title, date, page)
+    # ── 7. 백그라운드 처리 위임 ───────────────────────────
+    background_tasks.add_task(
+        _process_meeting, page_id, page_url, title, date, page, notion
+    )
 
     return JSONResponse({"status": "accepted", "title": title}, status_code=202)
 
