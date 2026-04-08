@@ -278,6 +278,10 @@ async def webhook_meeting_summary(
         logger.warning(f"비표준 User-Agent 감지: {user_agent}")
 
     # ── 4. workspace_id 추출 및 Notion Client 결정 ────────
+    logger.info(f"payload keys: {list(body.keys())}")
+    logger.info(f"payload source: {body.get('source')}")
+    logger.info(f"payload data keys: {list((body.get('data') or {}).keys())}")
+
     data = body.get("data") or {}
     workspace_id = (
         body.get("workspace_id")
@@ -285,6 +289,7 @@ async def webhook_meeting_summary(
         or body.get("source", {}).get("workspace_id")
     )
     if not workspace_id:
+        logger.warning(f"workspace_id 없음. 전체 payload: {body}")
         raise HTTPException(status_code=400, detail="workspace_id를 찾을 수 없습니다.")
 
     notion = WORKSPACE_CLIENTS.get(workspace_id)
